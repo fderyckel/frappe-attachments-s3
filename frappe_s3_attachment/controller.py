@@ -51,6 +51,19 @@ class S3Operations(object):
         """
         Generate keys for s3 objects uploaded with file name attached.
         """
+        hook_cmd = frappe.get_hooks().get("s3_key_generator")
+        if hook_cmd:
+            try:
+                k = frappe.get_attr(hook_cmd[0])(
+                    file_name=file_name,
+                    parent_doctype=parent_doctype,
+                    parent_name=parent_name
+                )
+                if k:
+                    return k.rstrip('/').lstrip('/')
+            except:
+                pass
+
         file_name = file_name.replace(' ', '_')
         file_name = self.strip_special_chars(file_name)
         key = ''.join(
@@ -155,7 +168,7 @@ class S3Operations(object):
         """
         return self.S3_CLIENT.get_object(Bucket=self.BUCKET, Key=key)
 
-    def get_url(self, key):
+    def get_url(self, key, file_name=None):
         """
         Return url.
 
@@ -166,11 +179,18 @@ class S3Operations(object):
             self.signed_url_expiry_time = self.s3_settings_doc.signed_url_expiry_time # noqa
         else:
             self.signed_url_expiry_time = 120
+        params = {
+                'Bucket': self.BUCKET,
+                'Key': key,
+
+        }
+        if file_name:
+            params['ResponseContentDisposition'] = 'filename={}'.format(file_name)
 
         url = self.S3_CLIENT.generate_presigned_url(
             'get_object',
-            Params={'Bucket': self.BUCKET, 'Key': key},
-            ExpiresIn=self.signed_url_expiry_time
+            Params=params,
+            ExpiresIn=self.signed_url_expiry_time,
         )
 
         return url
@@ -186,7 +206,8 @@ def file_upload_to_s3(doc, method):
     site_path = frappe.utils.get_site_path()
     parent_doctype = doc.attached_to_doctype
     parent_name = doc.attached_to_name
-    if parent_doctype != "Data Import":
+    ignore_s3_upload_for_doctype = frappe.local.conf.get('ignore_s3_upload_for_doctype') or ['Data Import']
+    if parent_doctype not in ignore_s3_upload_for_doctype:
         if not doc.is_private:
             file_path = site_path + '/public' + path
         else:
@@ -199,7 +220,7 @@ def file_upload_to_s3(doc, method):
 
         if doc.is_private:
             method = "frappe_s3_attachment.controller.generate_file"
-            file_url = """/api/method/{0}?key={1}""".format(method, key)
+            file_url = """/api/method/{0}?key={1}&file_name={2}""".format(method, key, doc.file_name)
         else:
             file_url = '{}/{}/{}'.format(
                 s3_upload.S3_CLIENT.meta.endpoint_url,
@@ -210,17 +231,21 @@ def file_upload_to_s3(doc, method):
         doc = frappe.db.sql("""UPDATE `tabFile` SET file_url=%s, folder=%s,
             old_parent=%s, content_hash=%s WHERE name=%s""", (
             file_url, 'Home/Attachments', 'Home/Attachments', key, doc.name))
+
+        if frappe.get_meta(parent_doctype).get('image_field'):
+            frappe.db.set_value(parent_doctype, parent_name, frappe.get_meta(parent_doctype).get('image_field'), file_url)
+
         frappe.db.commit()
 
 
 @frappe.whitelist()
-def generate_file(key=None):
+def generate_file(key=None, file_name=None):
     """
     Function to stream file from s3.
     """
     if key:
         s3_upload = S3Operations()
-        signed_url = s3_upload.get_url(key)
+        signed_url = s3_upload.get_url(key, file_name)
         frappe.local.response["type"] = "redirect"
         frappe.local.response["location"] = signed_url
     else:
